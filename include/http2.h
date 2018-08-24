@@ -75,6 +75,12 @@ enum swHttp2SettingId
     SW_HTTP2_SETTINGS_MAX_HEADER_LIST_SIZE   = 0x6,
 };
 
+enum swHttp2StreamType
+{
+    SW_HTTP2_STREAM_NORMAL      = 0,
+    SW_HTTP2_STREAM_PIPELINE    = 1,
+};
+
 #define SW_HTTP2_FRAME_HEADER_SIZE            9
 #define SW_HTTP2_SETTING_OPTION_SIZE          6
 #define SW_HTTP2_FRAME_PING_PAYLOAD_SIZE      8
@@ -112,6 +118,14 @@ static sw_inline uint32_t swHttp2_get_length(char *buf)
 {
     return (((uint8_t) buf[0]) << 16) + (((uint8_t) buf[1]) << 8) + (uint8_t) buf[2];
 }
+
+static sw_inline uint32_t swHttp2_get_increment_size(char *buf)
+{
+    return (((uint8_t) buf[1 + SW_HTTP2_FRAME_HEADER_SIZE]) << 16)      \
+            + (((uint8_t) buf[2 + SW_HTTP2_FRAME_HEADER_SIZE]) << 8)    \
+            + (uint8_t) buf[3 + SW_HTTP2_FRAME_HEADER_SIZE];
+}
+
 
 int swHttp2_get_frame_length(swProtocol *protocol, swConnection *conn, char *buf, uint32_t length);
 int swHttp2_send_setting_frame(swProtocol *protocol, swConnection *conn);

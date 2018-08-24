@@ -19,51 +19,64 @@
 #include <sys/ipc.h>
 #include <sys/msg.h>
 
-void swMsgQueue_free(swMsgQueue *q)
+int swMsgQueue_free(swMsgQueue *q)
 {
-    if (q->remove)
+    if (msgctl(q->msg_id, IPC_RMID, 0) < 0)
     {
-        msgctl(q->msg_id, IPC_RMID, 0);
+        swSysError("msgctl(%d, IPC_RMID) failed.", q->msg_id);
+        return SW_ERR;
     }
+    return SW_OK;
 }
 
 void swMsgQueue_set_blocking(swMsgQueue *q, uint8_t blocking)
 {
-    q->ipc_wait = blocking ? 0 : IPC_NOWAIT;
-}
-
-int swMsgQueue_create(swMsgQueue *q, int blocking, key_t msg_key, long type)
-{
-    int msg_id;
     if (blocking == 0)
     {
-        q->ipc_wait = IPC_NOWAIT;
+        q->flags = q->flags | IPC_NOWAIT;
     }
     else
     {
-        q->ipc_wait = 0;
+        q->flags = q->flags & (~IPC_NOWAIT);
     }
-    q->blocking = blocking;
-    msg_id = msgget(msg_key, IPC_CREAT | 0666);
+}
+
+int swMsgQueue_create(swMsgQueue *q, int blocking, key_t msg_key, int perms)
+{
+    if (perms <= 0 || perms >= 01000)
+    {
+        perms = 0666;
+    }
+    int msg_id;
+    msg_id = msgget(msg_key, IPC_CREAT | perms);
     if (msg_id < 0)
     {
-        swWarn("msgget() failed. Error: %s[%d]", strerror(errno), errno);
+        swSysError("msgget() failed.");
         return SW_ERR;
     }
     else
     {
+        bzero(q, sizeof(swMsgQueue));
         q->msg_id = msg_id;
-        q->type = type;
+        q->perms = perms;
+        q->blocking = blocking;
+        swMsgQueue_set_blocking(q, blocking);
     }
     return 0;
 }
 
 int swMsgQueue_pop(swMsgQueue *q, swQueue_data *data, int length)
 {
-    int flag = q->ipc_wait;
-    long type = data->mtype;
-
-    return msgrcv(q->msg_id, data, length, type, flag);
+    int ret = msgrcv(q->msg_id, data, length, data->mtype, q->flags);
+    if (ret < 0)
+    {
+        SwooleG.error = errno;
+        if (errno != ENOMSG && errno != EINTR)
+        {
+            swSysError("msgrcv(%d, %d, %ld) failed.", q->msg_id, length, data->mtype);
+        }
+    }
+    return ret;
 }
 
 int swMsgQueue_push(swMsgQueue *q, swQueue_data *in, int length)
@@ -72,20 +85,21 @@ int swMsgQueue_push(swMsgQueue *q, swQueue_data *in, int length)
 
     while (1)
     {
-        ret = msgsnd(q->msg_id, in, length, q->ipc_wait);
+        ret = msgsnd(q->msg_id, in, length, q->flags);
         if (ret < 0)
         {
+            SwooleG.error = errno;
             if (errno == EINTR)
             {
                 continue;
             }
             else if (errno == EAGAIN)
             {
-                swYield();
-                continue;
+                return -1;
             }
             else
             {
+                swSysError("msgsnd(%d, %d, %ld) failed.", q->msg_id, length, in->mtype);
                 return -1;
             }
         }
@@ -99,11 +113,11 @@ int swMsgQueue_push(swMsgQueue *q, swQueue_data *in, int length)
 
 int swMsgQueue_stat(swMsgQueue *q, int *queue_num, int *queue_bytes)
 {
-    struct msqid_ds stat;
-    if (msgctl(q->msg_id, IPC_STAT, &stat) == 0)
+    struct msqid_ds __stat;
+    if (msgctl(q->msg_id, IPC_STAT, &__stat) == 0)
     {
-        *queue_num = stat.msg_qnum;
-        *queue_bytes = stat.msg_cbytes;
+        *queue_num = __stat.msg_qnum;
+        *queue_bytes = __stat.msg_cbytes;
         return 0;
     }
     else

@@ -35,6 +35,13 @@ enum http_response_flag
     HTTP_RESPONSE_CONTENT_TYPE     = 1u << 5,
 };
 
+enum http_compress_method
+{
+    HTTP_COMPRESS_GZIP = 1,
+    HTTP_COMPRESS_DEFLATE,
+    HTTP_COMPRESS_BR,
+};
+
 typedef struct
 {
     enum php_http_method method;
@@ -48,7 +55,6 @@ typedef struct
     swString *post_buffer;
     uint32_t post_length;
 
-    zval *zdata;
     zval *zobject;
     zval *zserver;
     zval *zheader;
@@ -57,8 +63,7 @@ typedef struct
     zval *zcookie;
     zval *zrequest;
     zval *zfiles;
-#if PHP_MAJOR_VERSION >= 7
-    zval _zdata;
+    zval *ztmpfiles;
     zval _zobject;
     zval _zrequest;
     zval _zserver;
@@ -67,7 +72,7 @@ typedef struct
     zval _zpost;
     zval _zfiles;
     zval _zcookie;
-#endif
+    zval _ztmpfiles;
 } http_request;
 
 typedef struct
@@ -78,25 +83,27 @@ typedef struct
     zval *zobject;
     zval *zheader;
     zval *zcookie;
+    zval *ztrailer;
 
-#if PHP_MAJOR_VERSION >= 7
     zval _zobject;
     zval _zheader;
     zval _zcookie;
-#endif
+    zval _ztrailer;
 } http_response;
 
 typedef struct
 {
     int fd;
-
     uint32_t end :1;
     uint32_t send_header :1;
-    uint32_t gzip_enable :1;
-    uint32_t gzip_level :4;
+#ifdef SW_HAVE_ZLIB
+    uint32_t enable_compression :1;
+#endif
     uint32_t chunk :1;
     uint32_t keepalive :1;
     uint32_t http2 :1;
+    uint32_t upgrade :1;
+    uint32_t detached :1;
 
     uint32_t request_read :1;
     uint32_t current_header_name_allocated :1;
@@ -107,6 +114,11 @@ typedef struct
     uint32_t stream_id;
 #endif
 
+#ifdef SW_HAVE_ZLIB
+    int8_t compression_level;
+    int8_t compression_method;
+#endif
+
     http_request request;
     http_response response;
 
@@ -114,12 +126,14 @@ typedef struct
     multipart_parser *mt_parser;
     struct _swoole_http_client *client;
 
+    uint16_t input_var_num;
     char *current_header_name;
     size_t current_header_name_len;
     char *current_input_name;
     char *current_form_data_name;
     size_t current_form_data_name_len;
     char *current_form_data_value;
+    zval *current_multipart_header;
 
 } http_context;
 
@@ -129,10 +143,12 @@ typedef struct _swoole_http_client
     uint32_t http2 :1;
 
 #ifdef SW_USE_HTTP2
+    uint32_t init :1;
     swHashMap *streams;
     nghttp2_hd_inflater *deflater;
     nghttp2_hd_inflater *inflater;
     uint32_t window_size;
+    uint32_t remote_window_size;
 #endif
 
 } swoole_http_client;
@@ -143,7 +159,7 @@ typedef struct _swoole_http_client
 int swoole_websocket_onMessage(swEventData *);
 int swoole_websocket_onHandshake(swListenPort *port, http_context *);
 void swoole_websocket_onOpen(http_context *);
-void swoole_websocket_onReuqest(http_context *);
+void swoole_websocket_onRequest(http_context *);
 
 /**
  * Http Context
@@ -156,9 +172,12 @@ int swoole_http_parse_form_data(http_context *ctx, const char *boundary_str, int
 array_init(z##name);\
 zend_update_property(swoole_http_##class##_class_entry_ptr, z##class##_object, ZEND_STRL(#name), z##name TSRMLS_CC);\
 ctx->class.z##name = sw_zend_read_property(swoole_http_##class##_class_entry_ptr, z##class##_object, ZEND_STRL(#name), 0 TSRMLS_CC);\
-sw_copy_to_stack(ctx->class.z##name, ctx->request._z##name);\
+sw_copy_to_stack(ctx->class.z##name, ctx->class._z##name);\
 sw_zval_ptr_dtor(&z##name);\
 z##name = ctx->class.z##name;
+
+#define http_strncasecmp(const_str, at, length) ((length >= sizeof(const_str)-1) &&\
+        (strncasecmp(at, ZEND_STRL(const_str)) == 0))
 
 #ifdef SW_USE_HTTP2
 /**
@@ -179,6 +198,45 @@ extern zend_class_entry swoole_http_request_ce;
 extern zend_class_entry *swoole_http_request_class_entry_ptr;
 
 extern swString *swoole_http_buffer;
+#ifdef SW_HAVE_ZLIB
 extern swString *swoole_zlib_buffer;
+int swoole_http_response_compress(swString *body, int method, int level);
+void swoole_http_get_compression_method(http_context *ctx, const char *accept_encoding, size_t length);
+const char* swoole_http_get_content_encoding(http_context *ctx);
+#endif
+
+static sw_inline int http_parse_set_cookies(const char *at, size_t length, zval *cookies, zval *set_cookie_headers)
+{
+    int l_cookie = 0;
+    char *p = (char*) memchr(at, ';', length);
+    if (p)
+    {
+        l_cookie = p - at;
+    }
+    else
+    {
+        l_cookie = length;
+    }
+
+    p = (char*) memchr(at, '=', length);
+    int l_key = 0;
+    if (p)
+    {
+        l_key = p - at;
+    }
+    if (l_key == 0 || l_key >= SW_HTTP_COOKIE_KEYLEN || l_key >= length - 1)
+    {
+        swWarn("cookie key format is wrong.");
+        return SW_ERR;
+    }
+
+    char keybuf[SW_HTTP_COOKIE_KEYLEN];
+    memcpy(keybuf, at, l_key);
+    keybuf[l_key] = '\0';
+    sw_add_assoc_stringl_ex(cookies, keybuf, l_key + 1, (char*) at + l_key + 1, l_cookie - l_key - 1, 1);
+    sw_add_assoc_stringl_ex(set_cookie_headers, keybuf, l_key + 1, (char*) at, length, 1);
+
+    return SW_OK;
+}
 
 #endif /* SWOOLE_HTTP_H_ */

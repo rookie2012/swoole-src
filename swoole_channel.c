@@ -18,12 +18,13 @@
 
 
 #include "php_swoole.h"
-
+#include "swoole_coroutine.h"
 
 static PHP_METHOD(swoole_channel, __construct);
 static PHP_METHOD(swoole_channel, __destruct);
 static PHP_METHOD(swoole_channel, push);
 static PHP_METHOD(swoole_channel, pop);
+static PHP_METHOD(swoole_channel, peek);
 static PHP_METHOD(swoole_channel, stats);
 
 static zend_class_entry swoole_channel_ce;
@@ -37,16 +38,17 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_channel_push, 0, 0, 1)
     ZEND_ARG_INFO(0, data)
 ZEND_END_ARG_INFO()
 
-ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_channel_void, 0, 0, 0)
+ZEND_BEGIN_ARG_INFO_EX(arginfo_swoole_void, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
 static const zend_function_entry swoole_channel_methods[] =
 {
     PHP_ME(swoole_channel, __construct, arginfo_swoole_channel_construct, ZEND_ACC_PUBLIC | ZEND_ACC_CTOR)
-    PHP_ME(swoole_channel, __destruct, arginfo_swoole_channel_void, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
+    PHP_ME(swoole_channel, __destruct, arginfo_swoole_void, ZEND_ACC_PUBLIC | ZEND_ACC_DTOR)
     PHP_ME(swoole_channel, push, arginfo_swoole_channel_push, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_channel, pop, arginfo_swoole_channel_void, ZEND_ACC_PUBLIC)
-    PHP_ME(swoole_channel, stats, arginfo_swoole_channel_void, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_channel, pop, arginfo_swoole_void, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_channel, peek, arginfo_swoole_void, ZEND_ACC_PUBLIC)
+    PHP_ME(swoole_channel, stats, arginfo_swoole_void, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
@@ -66,10 +68,15 @@ static PHP_METHOD(swoole_channel, __construct)
         RETURN_FALSE;
     }
 
+    if (size < SW_BUFFER_SIZE_STD)
+    {
+        size = SW_BUFFER_SIZE_STD;
+    }
+
     swChannel *chan = swChannel_new(size, SW_BUFFER_SIZE_STD, SW_CHAN_LOCK | SW_CHAN_SHM);
     if (chan == NULL)
     {
-        zend_throw_exception(swoole_exception_class_entry_ptr, "cahnnel create failed.", SW_ERROR_MALLOC_FAIL TSRMLS_CC);
+        zend_throw_exception(swoole_exception_class_entry_ptr, "failed to create channel.", SW_ERROR_MALLOC_FAIL TSRMLS_CC);
         RETURN_FALSE;
     }
     swoole_set_object(getThis(), chan);
@@ -77,6 +84,8 @@ static PHP_METHOD(swoole_channel, __construct)
 
 static PHP_METHOD(swoole_channel, __destruct)
 {
+    SW_PREVENT_USER_DESTRUCT;
+
     swoole_set_object(getThis(), NULL);
 }
 
@@ -91,8 +100,10 @@ static PHP_METHOD(swoole_channel, push)
     }
 
     swEventData buf;
-    php_swoole_task_pack(&buf, zdata TSRMLS_CC);
-
+    if (php_swoole_task_pack(&buf, zdata TSRMLS_CC) < 0)
+    {
+        RETURN_FALSE;
+    }
     SW_CHECK_RETURN(swChannel_push(chan, &buf, sizeof(buf.info) + buf.info.len));
 }
 
@@ -108,6 +119,33 @@ static PHP_METHOD(swoole_channel, pop)
     }
 
     zval *ret_data = php_swoole_task_unpack(&buf TSRMLS_CC);
+    if (ret_data == NULL)
+    {
+        RETURN_FALSE;
+    }
+
+    RETVAL_ZVAL(ret_data, 0, NULL);
+    efree(ret_data);
+}
+
+static PHP_METHOD(swoole_channel, peek)
+{
+    swChannel *chan = swoole_get_object(getThis());
+    swEventData buf;
+
+    int n = swChannel_peek(chan, &buf, sizeof(buf));
+    if (n < 0)
+    {
+        RETURN_FALSE;
+    }
+
+    swTask_type(&buf) |= SW_TASK_PEEK;
+    zval *ret_data = php_swoole_task_unpack(&buf TSRMLS_CC);
+    if (ret_data == NULL)
+    {
+        RETURN_FALSE;
+    }
+
     RETVAL_ZVAL(ret_data, 0, NULL);
     efree(ret_data);
 }
